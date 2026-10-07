@@ -7,8 +7,103 @@ the committed `package-lock.json` instead of resolved fresh from semver ranges o
 It lives under `eng/common` so it syncs to every repo that consumes the shared eval pipeline
 templates.
 
-- The only dependency should be `@microsoft/vally-cli`, pinned to the version CI should evaluate with.
+- This evaluator package's only dependency is `@microsoft/vally-cli`, pinned to the version CI should evaluate with.
 - `package-lock.json` must be committed so `npm ci` is deterministic.
+- Optional Blob publication is isolated in [publisher](publisher/), with
+  its own small package/lock and tests. Shard evaluator restores do not install it.
+
+## Complete build results and direct Blob publishing
+
+Shards now retain the newest invocation's raw JSONL, JUnit and a completion marker
+via [shard-results](lib/shard-results.ts), including failed evaluations.
+Summary checks the full Prepare matrix and selects each expected shard's highest
+attempt once for Markdown, the Tests tab and bundling. Missing, interrupted or
+corrupt results remain incomplete; later failed attempts never fall back to older
+successful artifacts. The selected-results path requires valid current-build
+timeline evidence, read during selection with three bounded transient retries.
+Unverified or ambiguous attempts cannot authorize publication. The legacy JUnit-only
+summary remains supported. No historical build download or reconstruction is involved.
+
+The [publishing step](../../pipelines/templates/steps/eval-publish-results.yml) restores
+the publisher's small dependency lock, prepares one saved ZIP, and uploads it through
+`AzureCLI@2` using `eval-dashboard-sc`. There is no enterprise checkout, dashboard
+upload, evaluator rerun or container creation. The storage container and notification
+target are fixed in [storage.ts](publisher/storage.ts), not queue-time/environment inputs.
+
+| Control | Current use |
+| --- | --- |
+| `publishDashboardResults` | The only publishing switch; defaults to `true` in the three tools pipelines. Set `false` to disable both upload and Azure Storage egress |
+| `createDashboardBundle` | Shared-template artifact-only mode; enabled for all three tools entrypoints |
+
+Publication requires organization `https://dev.azure.com/azure-sdk/`,
+project `internal`, repository `Azure/azure-sdk-tools`, pipeline ID **8255** (workflow),
+**8256** (skill) or **8246** (live), exact `refs/heads/main`, and a CI, scheduled or
+manual reason. The switch does not bypass those checks. Feature branches, other
+repositories/definitions, PRs, pull refs and public-project runs do not publish through
+these entrypoints, even when the switch is enabled.
+
+There is no separate automatic-publication, feature-branch override or network-access
+flag. Publication requests the documented
+[AzureStorage policy](https://aka.ms/1es/netiso/pipelinetemplates), which
+keeps `DefaultDeny, CFSClean, CFSClean2, CFSClean3` and allows Azure Storage egress
+for **all processes in that pipeline**, not just one container. It grants no RBAC
+access. Other synced consumers need matching `AllowAzureStorage` support in their
+repo-owned 1ES redirect and explicit main-branch onboarding; the shared archetype
+still defaults to no publication. Artifact-only runs request neither publishing
+credentials nor storage egress. Keep approvals, network restrictions and existing
+consumer defaults unchanged.
+
+These entrypoints run real evaluations and consume model quota; there is no synthetic
+pipeline mode. Completed failed evaluations publish before their existing test gate;
+missing or incomplete results fail Summary and cannot publish.
+
+### Archive and retry contract
+
+The fixed container is `https://evaltestsummary.blob.core.windows.net/vally-results`.
+An archive uses `v1/<org>/<encoded-project>/<definition>/<build>/<Summary-attempt>/dashboard-bundle.zip`.
+It contains a schema-v1 manifest, executed plain-eval JSONL trials, Markdown and JUnit,
+never debug files, MCP binaries or unrelated workspace contents. Non-executed skips
+remain in raw artifacts and JUnit/Markdown; an entirely skipped shard is incomplete.
+
+Reader limits are **32 MiB ZIP, 128 MiB expanded, 10,000 entries and 100,000 trials**.
+Canonical identities, UTC calendar dates, safe entries and counts are validated
+before upload. Blob metadata records schema, SHA-256, hashed publisher identity and
+the original storage time; Azure RBAC remains the authorization boundary.
+
+Uploads use create-only `ifNoneMatch: *`, at most four attempts with the **same saved
+bytes**, honoring bounded backpressure. Existing archives must match metadata,
+owner, checksum and size. Changed content needs a new Summary attempt, not an overwrite.
+The publisher never deletes archives; the dashboard's separate identity stays read-only.
+Local storage receipts are replaced atomically before any notification. Later
+notification/status-save failures cannot erase the retained successful storage result.
+
+### Notification and recovery
+
+Every successful publication sends only `{blobName, sha256}` to the reviewed
+`https://azsdk-eval-bue6a7dwanatgpb3.westus3-01.azurewebsites.net/api/refresh` endpoint.
+The publisher requests `api://258998df-81ec-460c-bdd7-56a9bdde1e48/.default`; the dashboard
+validates the Entra v2 token's GUID `aud`, not the `api://` resource string.
+The application needs `Dashboard.Refresh` permission and the receiver's Easy Auth
+client allowlist. Blob permission alone does not grant notification access.
+
+Signals are bounded to 2 KiB, retry at most four times, honor `Retry-After` and never
+follow redirects. Failure is a warning after durable upload. Browser reload/startup
+and daily reconciliation recover missed signals without changing source archives.
+Do not replace viewer authentication or network restrictions to make a signal succeed.
+
+### Publisher tests and diagnostics
+
+Run `npm ci --ignore-scripts` and `npm test` from `publisher` (`npm.cmd` on Windows),
+then `npm test` from this directory. Tests use synthetic fixtures and fake transports;
+they do not evaluate models or contact production services. A real-run test remains
+separate from local checks and should use an already approved evaluation run.
+
+The saved result includes a bounded operation/error code/HTTP status, never raw SDK
+requests, tokens or result contents. Token acquisition failures require checking the
+service connection; Blob 403 requires checking its data-role scope; network failures
+require checking approved egress. Preserve the original archive for conflicts, and
+retry the signal or the same saved bytes for outages. Never substitute account keys,
+relax TLS or broaden permissions to hide a failed request.
 
 ## TypeScript (no build step)
 
@@ -17,6 +112,7 @@ no `enum`/`namespace`/parameter properties, no emit). CI pins Node `22.x`, which
 unflagged on `>=22.18`; the pipeline `node` invocations and the `npm test` script pass
 `--experimental-strip-types` so the same sources also run on older local Node (`>=22.6`), which
 prints a harmless `ExperimentalWarning`. Relative imports use explicit `.ts` specifiers, as Node requires.
+The standalone Blob publisher uses the same execution model; it adds no compiler or TypeScript runtime dependency.
 
 ## Vendored files
 
@@ -45,6 +141,7 @@ cd ../../../..
 ./eng/common/scripts/eval/node_modules/.bin/vally lint .
 ```
 
-This matches the CI job step-for-step, so a green local run on the current lockfile means a green CI run.
+This uses the same locked CLI as CI. A passing local run does not validate the
+agent's credentials, network access, artifact permissions or live-service behavior.
 
 A global install (`npm install -g @microsoft/vally-cli@<version>`) still works for ad-hoc iteration, but it won't match the transitive dependency tree CI uses and isn't a substitute for the steps above when validating a version bump.
